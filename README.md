@@ -1,17 +1,11 @@
 # 123
 
-LGSOC 文件驱动诊断流水线：`yano_matrix_lgsoc_demo.py`
+LGSOC 神经符号 AI 示例代码：`yano_matrix_lgsoc_demo.py`
 
 ## 运行
 
 ```bash
-python yano_matrix_lgsoc_demo.py \
-  --raw-note-file <path_or_url_to_txt> \
-  --candidates-file <path_or_url_to_json> \
-  --kg-file <path_or_url_to_json> \
-  --report-out report_out/report.md
+python yano_matrix_lgsoc_demo.py
 ```
 
-说明：
-- 所有输入文件会先进行一次联网识别（HTTP 调用）再读取。
-- 支持本地路径与 HTTP/HTTPS URL。
+脚本包含：迁移学习、原型网络小样本学习、知识图谱约束门控、多智能体流程示例。
