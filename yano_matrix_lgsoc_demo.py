@@ -1,206 +1,188 @@
-"""
-YANO Matrix (LGSOC) 神经符号 AI 实验设计示例代码。
-
-说明：
-- 这是一个“可运行的研究原型（research prototype）”，用于把你给出的方案落地成 Python 架构。
-- 代码重点展示：
-  1) 迁移学习（HGSOC -> LGSOC）
-  2) 原型网络小样本学习 + 简化 SMOTE
-  3) 知识图谱约束（3-hop 门控惩罚）
-  4) 多智能体流水线（清洗/质控/推理/报告/反思）
-
-依赖：
-- numpy
-- torch
-"""
-
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Tuple, Any
+import argparse
 import json
 import math
-import random
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
-
-# -----------------------------
-# 数据层（模拟多组学数据）
-# -----------------------------
-
-def seed_all(seed: int = 42) -> None:
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from html.parser import HTMLParser
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.error import URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 
-def make_synthetic_omics(n: int, d: int, n_classes: int, shift: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-    """构造简化多组学特征：不同类别高斯簇。"""
-    x_list, y_list = [], []
-    per_cls = n // n_classes
-    for c in range(n_classes):
-        mean = np.zeros(d)
-        mean[c % d] = 2.5 + shift
-        cov = np.eye(d) * (0.7 + c * 0.03)
-        cls_x = np.random.multivariate_normal(mean, cov, size=per_cls)
-        cls_y = np.full(per_cls, c)
-        x_list.append(cls_x)
-        y_list.append(cls_y)
-    x = np.vstack(x_list).astype(np.float32)
-    y = np.concatenate(y_list).astype(np.int64)
-    idx = np.random.permutation(len(y))
-    return x[idx], y[idx]
+@dataclass
+class RunDiagnostic:
+    stage: str
+    status: str
+    duration_ms: float
+    key_metrics: Dict[str, Any]
+    notes_zh: str
 
 
-# -----------------------------
-# Layer 1: 迁移学习特征提取
-# -----------------------------
+@dataclass
+class RunDiagnostics:
+    items: List[RunDiagnostic] = field(default_factory=list)
 
-class FeatureNet(nn.Module):
-    def __init__(self, in_dim: int, hidden: int, emb_dim: int, n_classes: int):
-        super().__init__()
-        self.backbone = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, emb_dim),
-            nn.ReLU(),
+    def add(self, stage: str, status: str, duration_ms: float, key_metrics: Dict[str, Any], notes_zh: str) -> None:
+        self.items.append(
+            RunDiagnostic(
+                stage=stage,
+                status=status,
+                duration_ms=round(duration_ms, 2),
+                key_metrics=key_metrics,
+                notes_zh=notes_zh,
+            )
         )
-        self.classifier = nn.Linear(emb_dim, n_classes)
 
-    def embed(self, x: torch.Tensor) -> torch.Tensor:
-        return self.backbone(x)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.classifier(self.embed(x))
+    def to_list(self) -> List[Dict[str, Any]]:
+        return [asdict(i) for i in self.items]
 
 
-@dataclass
-class TransferLearningLayer:
-    in_dim: int
-    hidden: int
-    emb_dim: int
-    src_classes: int
-    tgt_classes: int
-    device: str = "cpu"
-    model: FeatureNet = field(init=False)
+class _TitleParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.in_title = False
+        self.title = ""
 
-    def __post_init__(self) -> None:
-        self.model = FeatureNet(self.in_dim, self.hidden, self.emb_dim, self.src_classes).to(self.device)
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        if tag.lower() == "title":
+            self.in_title = True
 
-    def pretrain_source(self, x_src: np.ndarray, y_src: np.ndarray, epochs: int = 20, lr: float = 1e-3) -> None:
-        x = torch.tensor(x_src, device=self.device)
-        y = torch.tensor(y_src, device=self.device)
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "title":
+            self.in_title = False
 
-        opt = optim.Adam(self.model.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
-
-        self.model.train()
-        for _ in range(epochs):
-            logits = self.model(x)
-            loss = criterion(logits, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-    def finetune_target_last_layer(self, x_tgt: np.ndarray, y_tgt: np.ndarray, epochs: int = 15, lr: float = 5e-3) -> None:
-        # 冻结前 N-1 层（backbone），只训练最后分类头
-        for p in self.model.backbone.parameters():
-            p.requires_grad = False
-
-        # 重新定义分类头以适配 LGSOC 任务
-        self.model.classifier = nn.Linear(self.emb_dim, self.tgt_classes).to(self.device)
-
-        x = torch.tensor(x_tgt, device=self.device)
-        y = torch.tensor(y_tgt, device=self.device)
-
-        opt = optim.Adam(self.model.classifier.parameters(), lr=lr)
-        criterion = nn.CrossEntropyLoss()
-
-        self.model.train()
-        for _ in range(epochs):
-            logits = self.model(x)
-            loss = criterion(logits, y)
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-
-    def extract_embeddings(self, x: np.ndarray) -> np.ndarray:
-        self.model.eval()
-        with torch.no_grad():
-            emb = self.model.embed(torch.tensor(x, device=self.device)).cpu().numpy()
-        return emb
-
-
-# -----------------------------
-# Layer 2: 原型网络 + 简化 SMOTE
-# -----------------------------
-
-def simple_smote(x: np.ndarray, y: np.ndarray, target_size: int) -> Tuple[np.ndarray, np.ndarray]:
-    """不依赖第三方 imblearn 的轻量 SMOTE：类内随机线性插值。"""
-    if len(y) >= target_size:
-        return x, y
-
-    x_new = [x]
-    y_new = [y]
-    classes, counts = np.unique(y, return_counts=True)
-    class_to_idx = {c: np.where(y == c)[0] for c in classes}
-
-    needed = target_size - len(y)
-    for _ in range(needed):
-        c = classes[np.argmin(counts)]  # 优先补最小类
-        idxs = class_to_idx[c]
-        i1, i2 = np.random.choice(idxs, 2, replace=True)
-        lam = np.random.uniform(0.15, 0.85)
-        syn = x[i1] * lam + x[i2] * (1 - lam)
-
-        x_new.append(syn[None, :])
-        y_new.append(np.array([c], dtype=y.dtype))
-
-        counts[np.where(classes == c)[0][0]] += 1
-
-    return np.vstack(x_new), np.concatenate(y_new)
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.title += data
 
 
 @dataclass
-class PrototypicalLayer:
-    def fit_prototypes(self, emb: np.ndarray, y: np.ndarray) -> Dict[int, np.ndarray]:
-        protos: Dict[int, np.ndarray] = {}
-        for c in np.unique(y):
-            protos[int(c)] = emb[y == c].mean(axis=0)
-        return protos
+class RemoteFileInspector:
+    endpoint: str
+    timeout_s: int = 15
 
-    def predict(self, emb_q: np.ndarray, prototypes: Dict[int, np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
-        classes = sorted(prototypes.keys())
-        proto_mat = np.stack([prototypes[c] for c in classes], axis=0)
+    def inspect(self, path_or_url: str, role: str) -> Dict[str, Any]:
+        parsed = urlparse(path_or_url)
+        is_remote = parsed.scheme in {"http", "https"}
+        filename = Path(parsed.path).name if is_remote else Path(path_or_url).name
+        suffix = Path(filename).suffix.lower()
+        inferred_type = "text"
+        if suffix == ".json":
+            inferred_type = "json"
+        if suffix == ".txt":
+            inferred_type = "txt"
 
-        # 距离越小，分数越高
-        dists = np.sqrt(((emb_q[:, None, :] - proto_mat[None, :, :]) ** 2).sum(axis=2))
-        scores = -dists
-        pred_idx = np.argmax(scores, axis=1)
-        preds = np.array([classes[i] for i in pred_idx])
-        conf = torch.softmax(torch.tensor(scores), dim=1).numpy()
-        return preds, conf
+        payload = {
+            "role": role,
+            "path_or_url": path_or_url,
+            "filename": filename,
+            "suffix": suffix,
+            "is_remote": is_remote,
+            "inferred_type": inferred_type,
+        }
+        req = Request(
+            self.endpoint,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": "Mozilla/5.0"},
+            method="POST",
+        )
+        with urlopen(req, timeout=self.timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="ignore")
+        try:
+            remote_echo = json.loads(body)
+        except json.JSONDecodeError:
+            remote_echo = {"raw": body[:256]}
+
+        return {
+            "role": role,
+            "filename": filename,
+            "suffix": suffix,
+            "is_remote": is_remote,
+            "inferred_type": inferred_type,
+            "inspect_endpoint": self.endpoint,
+            "inspect_ok": True,
+            "inspect_response_preview": str(remote_echo)[:200],
+        }
+
+    def read_after_inspection(self, path_or_url: str, role: str, expected_type: str) -> str:
+        meta = self.inspect(path_or_url=path_or_url, role=role)
+        if meta["inferred_type"] != expected_type:
+            raise ValueError(
+                f"文件类型不匹配: role={role}, expected={expected_type}, got={meta['inferred_type']}, file={path_or_url}"
+            )
+
+        parsed = urlparse(path_or_url)
+        if parsed.scheme in {"http", "https"}:
+            req = Request(path_or_url, headers={"User-Agent": "Mozilla/5.0"})
+            with urlopen(req, timeout=self.timeout_s) as resp:
+                return resp.read().decode("utf-8", errors="ignore")
+        return Path(path_or_url).read_text(encoding="utf-8")
 
 
-# -----------------------------
-# Layer 3: 知识图谱约束（图门控）
-# -----------------------------
+@dataclass
+class SemanticParserAgent:
+    def parse(self, raw_note: str) -> Dict[str, Any]:
+        mutation = re.findall(r"([A-Z0-9]{2,}_[A-Z0-9]{2,})", raw_note.upper())
+        dose = re.findall(r"(\d+)\s*mg", raw_note.lower())
+        return {
+            "mutation": mutation[0] if mutation else None,
+            "dose_mg": int(dose[0]) if dose else None,
+            "ovary_resected": "切除" in raw_note,
+            "symptom": "排卵痛" if "排卵痛" in raw_note else None,
+        }
+
+
+@dataclass
+class LogicAuditAgent:
+    def audit(self, record: Dict[str, Any]) -> List[str]:
+        warnings: List[str] = []
+        if record.get("ovary_resected") and record.get("symptom") == "排卵痛":
+            warnings.append("红色警告：已切除卵巢却记录排卵痛，建议人工复核/剔除。")
+        if record.get("mutation") is None:
+            warnings.append("黄色警告：病历未抽取到突变位点，建议补充原始文本。")
+        return warnings
+
+
+@dataclass
+class ReasoningAgent:
+    def reason(self, top_gene: str, top_score: float, evidence_count: int) -> str:
+        return f"候选靶点 {top_gene} 评分 {top_score:.3f}，外部证据条数 {evidence_count}。"
+
+
+@dataclass
+class ReflectionAgent:
+    memory: List[Dict[str, Any]] = field(default_factory=list)
+
+    def apply_feedback_update(self, feedback: Dict[str, Any]) -> Dict[str, Any]:
+        self.memory.append(feedback)
+        return {
+            "priority_delta": float(feedback.get("priority_delta", 0.0)),
+            "validated": bool(feedback.get("validated", False)),
+            "memory_size": len(self.memory),
+        }
+
+
+@dataclass
+class ReportAgent:
+    def generate(self, payload: Dict[str, Any]) -> str:
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
 
 @dataclass
 class KnowledgeGraphConstraint:
     graph: Dict[str, List[str]]
     disease_node: str = "LGSOC"
     max_hop: int = 3
-    penalty: float = 0.4
 
     def shortest_hop(self, src: str, dst: str) -> int:
         if src == dst:
             return 0
-        q = [(src, 0)]
+        q: List[Tuple[str, int]] = [(src, 0)]
         visited = {src}
         while q:
             node, d = q.pop(0)
@@ -212,165 +194,181 @@ class KnowledgeGraphConstraint:
                     q.append((nxt, d + 1))
         return math.inf
 
-    def gate_score(self, gene: str, raw_score: float) -> float:
-        hop = self.shortest_hop(gene, self.disease_node)
-        if hop is math.inf or hop > self.max_hop:
-            return raw_score * (1.0 - self.penalty)
-        return raw_score
-
-
-# -----------------------------
-# 生成式多智能体层（框架化）
-# -----------------------------
 
 @dataclass
-class SemanticParserAgent:
-    """语义解析智能体：将非结构化文本转 JSON（示例化规则 + 占位LLM接口）。"""
+class WebEvidenceCrawler:
+    timeout_s: int = 15
 
-    def run(self, raw_note: str) -> Dict[str, Any]:
-        record = {
-            "mutation": "KRAS_G12D" if "KRAS" in raw_note.upper() else None,
-            "dose_mg": 100 if "100mg" in raw_note.lower() else None,
-            "ovary_resected": "切除" in raw_note,
-            "symptom": "排卵痛" if "排卵痛" in raw_note else None,
-        }
-        return record
+    def fetch(self, urls: List[str], keywords: List[str]) -> Dict[str, Any]:
+        results: List[Dict[str, Any]] = []
+        for url in urls:
+            try:
+                req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urlopen(req, timeout=self.timeout_s) as resp:
+                    html = resp.read().decode("utf-8", errors="ignore")
+                parser = _TitleParser()
+                parser.feed(html)
+                lowered = html.lower()
+                hit = sum(1 for k in keywords if k and k.lower() in lowered)
+                results.append({"url": url, "title": parser.title.strip()[:120], "keyword_hits": hit, "status": "OK"})
+            except (URLError, TimeoutError, ValueError) as exc:
+                results.append({"url": url, "title": "", "keyword_hits": 0, "status": "ERROR", "error": str(exc)})
+        return {"results": results, "evidence_count": sum(r["keyword_hits"] for r in results)}
 
-
-@dataclass
-class LogicAuditAgent:
-    """逻辑审查智能体：识别临床常识/时序矛盾。"""
-
-    def run(self, record: Dict[str, Any]) -> List[str]:
-        warnings = []
-        if record.get("ovary_resected") and record.get("symptom") == "排卵痛":
-            warnings.append("红色警告：已切除卵巢却记录排卵痛，建议人工复核/剔除。")
-        return warnings
-
-
-@dataclass
-class ReasoningAgent:
-    """推理决策智能体：输出可解释因果链。"""
-
-    def run(self, gene: str, score: float) -> str:
-        return (
-            f"候选靶点 {gene} 的综合得分为 {score:.3f}。"
-            "推理链：上游调控 -> 靶点功能 -> 下游信号 -> 表型关联。"
-            "建议进一步湿实验验证。"
-        )
-
-
-@dataclass
-class ReportAgent:
-    """报告生成智能体：整合结构化结果为文本报告（简版）。"""
-
-    def run(self, analysis: Dict[str, Any]) -> str:
-        return json.dumps(analysis, ensure_ascii=False, indent=2)
-
-
-@dataclass
-class ReflectionAgent:
-    """反思进化智能体：接收反馈并写入经验库（示例）。"""
-    memory: List[Dict[str, Any]] = field(default_factory=list)
-
-    def run(self, feedback: Dict[str, Any]) -> None:
-        self.memory.append(feedback)
-
-
-# -----------------------------
-# 总控 Pipeline
-# -----------------------------
 
 @dataclass
 class YanoMatrixPipeline:
-    transfer: TransferLearningLayer
-    proto: PrototypicalLayer
     kg: KnowledgeGraphConstraint
     parser_agent: SemanticParserAgent
     audit_agent: LogicAuditAgent
-    reason_agent: ReasoningAgent
-    report_agent: ReportAgent
+    reasoning_agent: ReasoningAgent
     reflection_agent: ReflectionAgent
+    report_agent: ReportAgent
+    crawler: WebEvidenceCrawler
 
-    def train(self, x_src: np.ndarray, y_src: np.ndarray, x_tgt: np.ndarray, y_tgt: np.ndarray) -> Dict[int, np.ndarray]:
-        self.transfer.pretrain_source(x_src, y_src)
-        self.transfer.finetune_target_last_layer(x_tgt, y_tgt)
+    def _format_diag_md(self, diagnostics: RunDiagnostics) -> str:
+        lines = ["## 运行诊断", "", "| stage | status | duration_ms | key_metrics | notes_zh |", "|---|---|---:|---|---|"]
+        for d in diagnostics.items:
+            lines.append(f"| {d.stage} | {d.status} | {d.duration_ms:.2f} | `{json.dumps(d.key_metrics, ensure_ascii=False)}` | {d.notes_zh} |")
+        return "\n".join(lines) + "\n"
 
-        emb_tgt = self.transfer.extract_embeddings(x_tgt)
-        emb_aug, y_aug = simple_smote(emb_tgt, y_tgt, target_size=1800)
-        prototypes = self.proto.fit_prototypes(emb_aug, y_aug)
-        return prototypes
+    def _print_summary(self, diagnostics: RunDiagnostics) -> None:
+        print("\n=== 运行诊断摘要 ===")
+        for d in diagnostics.items:
+            print(f"- [{d.stage}] {d.status} / {d.duration_ms:.2f}ms / {d.notes_zh}")
 
-    def infer_target_gene(self, prototypes: Dict[int, np.ndarray], x_query: np.ndarray, gene_name: str) -> Dict[str, Any]:
-        emb_q = self.transfer.extract_embeddings(x_query)
-        preds, conf = self.proto.predict(emb_q, prototypes)
+    def run_agents(
+        self,
+        raw_note: str,
+        candidates: List[Dict[str, Any]],
+        report_out: str,
+        evidence_urls: Optional[List[str]] = None,
+        wetlab_feedback: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        diagnostics = RunDiagnostics()
+        evidence_urls = evidence_urls or []
 
-        # 用最大类别置信度作为原始分数（示例）
-        raw_score = float(conf.max(axis=1).mean())
-        kg_score = self.kg.gate_score(gene_name, raw_score)
+        t0 = time.perf_counter()
+        parsed = self.parser_agent.parse(raw_note)
+        diagnostics.add("parser", "OK", (time.perf_counter() - t0) * 1000, {"mutation_count": int(parsed.get("mutation") is not None)}, "完成病历解析。")
 
-        explain = self.reason_agent.run(gene_name, kg_score)
-        return {
-            "pred_class": preds.tolist(),
-            "raw_score": raw_score,
-            "kg_score": kg_score,
-            "explanation": explain,
-        }
+        t0 = time.perf_counter()
+        warnings = self.audit_agent.audit(parsed)
+        diagnostics.add(
+            "audit",
+            "WARN" if any("红色警告" in w for w in warnings) else "OK",
+            (time.perf_counter() - t0) * 1000,
+            {"red_warning_count": sum("红色警告" in w for w in warnings)},
+            "完成病历逻辑审查。",
+        )
 
-    def run_agents(self, raw_text: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        parsed = self.parser_agent.run(raw_text)
-        warnings = self.audit_agent.run(parsed)
-        final = {
+        t0 = time.perf_counter()
+        crawl = self.crawler.fetch(evidence_urls, [parsed.get("mutation") or "", "LGSOC", "KRAS"])
+        top = max(candidates, key=lambda x: float(x.get("score", 0.0))) if candidates else {"gene": "UNKNOWN", "score": 0.0}
+        hop = self.kg.shortest_hop(str(top.get("gene", "UNKNOWN")), self.kg.disease_node)
+        high_priority_count = sum(1 for c in candidates if str(c.get("priority", "LOW")).upper() == "HIGH")
+        reason = self.reasoning_agent.reason(str(top.get("gene", "UNKNOWN")), float(top.get("score", 0.0)), int(crawl["evidence_count"]))
+        status = "OK"
+        notes = "推理完成。"
+        if hop is math.inf:
+            status = "WARN"
+            notes = "KG hop 不可达，建议补全图谱边或降低 hop 限制。"
+        elif high_priority_count == 0:
+            status = "WARN"
+            notes = "所有候选均低优先级，建议扩充候选并调整阈值。"
+        diagnostics.add(
+            "reasoning",
+            status,
+            (time.perf_counter() - t0) * 1000,
+            {"evidence_count": crawl["evidence_count"], "high_priority_count": high_priority_count, "kg_hop": None if hop is math.inf else hop},
+            notes,
+        )
+
+        reflection = None
+        if wetlab_feedback is not None:
+            t0 = time.perf_counter()
+            reflection = self.reflection_agent.apply_feedback_update(wetlab_feedback)
+            delta = abs(float(reflection.get("priority_delta", 0.0)))
+            diagnostics.add(
+                "reflection",
+                "WARN" if delta >= 0.20 else "OK",
+                (time.perf_counter() - t0) * 1000,
+                {"priority_delta": delta},
+                "反馈后优先级大幅波动，建议人工复核。" if delta >= 0.20 else "反馈更新已写入经验库。",
+            )
+
+        t0 = time.perf_counter()
+        report_payload = {
             "parsed_record": parsed,
             "warnings": warnings,
-            "analysis": analysis,
-            "report": self.report_agent.run({"parsed": parsed, "analysis": analysis, "warnings": warnings}),
+            "candidates": candidates,
+            "reasoning": reason,
+            "web_evidence": crawl,
+            "reflection": reflection,
         }
+        report_json = self.report_agent.generate(report_payload)
+        diagnostics.add("report", "OK", (time.perf_counter() - t0) * 1000, {"report_char_count": len(report_json)}, "报告生成完成。")
 
-        # 反思回写（模拟湿实验反馈）
-        self.reflection_agent.run({"gene": "KRAS", "validated": True, "delta": +0.07})
-        final["memory_size"] = len(self.reflection_agent.memory)
-        return final
+        report_path = Path(report_out)
+        report_path.parent.mkdir(parents=True, exist_ok=True)
+        diag_path = report_path.with_suffix(".diagnostics.json")
+
+        report_md = "# LGSOC 运行报告\n\n## 结果摘要\n\n```json\n" + report_json + "\n```\n\n" + self._format_diag_md(diagnostics)
+        report_path.write_text(report_md, encoding="utf-8")
+        diag_path.write_text(json.dumps({"diagnostics": diagnostics.to_list()}, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        self._print_summary(diagnostics)
+        print(f"报告输出: {report_path}")
+        print(f"诊断输出: {diag_path}")
+        return {"report_out": str(report_path), "diagnostics_out": str(diag_path)}
 
 
-def build_demo_kg() -> Dict[str, List[str]]:
-    return {
-        "KRAS": ["MAPK_pathway"],
-        "BRAF": ["MAPK_pathway"],
-        "MAPK_pathway": ["LGSOC"],
-        "MEK_inhibitor": ["MAPK_pathway"],
-        "TP53": ["DNA_repair"],
-        "DNA_repair": ["OtherCancer"],
-    }
+def _load_text_json_or_urls(inspector: RemoteFileInspector, path_or_url: str, role: str, expected_type: str) -> str:
+    return inspector.read_after_inspection(path_or_url=path_or_url, role=role, expected_type=expected_type)
 
 
 def main() -> None:
-    seed_all(42)
+    parser = argparse.ArgumentParser(description="LGSOC 文件驱动诊断流水线（先联网识别文件，再读取运行）")
+    parser.add_argument("--raw-note-file", required=True)
+    parser.add_argument("--candidates-file", required=True, help="JSON 数组，元素含 gene/score/priority")
+    parser.add_argument("--kg-file", required=True, help="JSON 邻接表")
+    parser.add_argument("--report-out", default="report_out/report.md")
+    parser.add_argument("--evidence-urls-file", default=None, help="TXT 文件，每行一个 URL")
+    parser.add_argument("--wetlab-feedback-file", default=None, help="JSON 文件，可选")
+    parser.add_argument("--file-inspect-endpoint", default="https://httpbin.org/anything/file-inspect", help="联网识别文件接口")
+    args = parser.parse_args()
 
-    # Source(HGSOC) > 500；Target(LGSOC) < 200（按你的设定）
-    x_src, y_src = make_synthetic_omics(n=600, d=64, n_classes=4, shift=0.2)
-    x_tgt, y_tgt = make_synthetic_omics(n=160, d=64, n_classes=3, shift=0.0)
-    x_query, _ = make_synthetic_omics(n=20, d=64, n_classes=3, shift=0.05)
+    inspector = RemoteFileInspector(endpoint=args.file_inspect_endpoint, timeout_s=15)
+
+    raw_note = _load_text_json_or_urls(inspector, args.raw_note_file, "raw_note", "txt")
+    candidates = json.loads(_load_text_json_or_urls(inspector, args.candidates_file, "candidates", "json"))
+    kg_graph = json.loads(_load_text_json_or_urls(inspector, args.kg_file, "kg", "json"))
+
+    evidence_urls: List[str] = []
+    if args.evidence_urls_file:
+        evidence_text = _load_text_json_or_urls(inspector, args.evidence_urls_file, "evidence_urls", "txt")
+        evidence_urls = [line.strip() for line in evidence_text.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+    wetlab_feedback = None
+    if args.wetlab_feedback_file:
+        wetlab_feedback = json.loads(_load_text_json_or_urls(inspector, args.wetlab_feedback_file, "wetlab_feedback", "json"))
 
     pipeline = YanoMatrixPipeline(
-        transfer=TransferLearningLayer(in_dim=64, hidden=128, emb_dim=32, src_classes=4, tgt_classes=3),
-        proto=PrototypicalLayer(),
-        kg=KnowledgeGraphConstraint(graph=build_demo_kg(), disease_node="LGSOC", max_hop=3, penalty=0.6),
+        kg=KnowledgeGraphConstraint(graph=kg_graph, disease_node="LGSOC", max_hop=3),
         parser_agent=SemanticParserAgent(),
         audit_agent=LogicAuditAgent(),
-        reason_agent=ReasoningAgent(),
-        report_agent=ReportAgent(),
+        reasoning_agent=ReasoningAgent(),
         reflection_agent=ReflectionAgent(),
+        report_agent=ReportAgent(),
+        crawler=WebEvidenceCrawler(timeout_s=15),
     )
-
-    prototypes = pipeline.train(x_src, y_src, x_tgt, y_tgt)
-    analysis = pipeline.infer_target_gene(prototypes, x_query, gene_name="KRAS")
-
-    raw_note = "患者术后卵巢已切除，但主诉仍有排卵痛；KRAS突变；方案100mg。"
-    result = pipeline.run_agents(raw_note, analysis)
-
-    print("=== YANO Matrix Demo Result ===")
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+    pipeline.run_agents(
+        raw_note=raw_note,
+        candidates=candidates,
+        report_out=args.report_out,
+        evidence_urls=evidence_urls,
+        wetlab_feedback=wetlab_feedback,
+    )
 
 
 if __name__ == "__main__":
