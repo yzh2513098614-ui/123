@@ -1,4 +1,4 @@
-# 123
+# YANO
 
 LGSOC 神经符号 AI 示例代码：`yano_matrix_lgsoc_demo.py`
 
