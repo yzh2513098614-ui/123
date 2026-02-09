@@ -401,7 +401,7 @@ class ReflectionEvolutionAgent:
             weight = 1.0 / (1 + i)
             delta = float(r.get("delta", 0.0))
             if not r.get("validated", False):
-                delta *= -0.5
+                delta *= 0.5
             score += weight * delta
         return float(np.clip(score, 0.0, 1.0))
 
@@ -483,6 +483,7 @@ class YanoMatrixPipeline:
         audit_stub = {"risk_score": 0.0, "audit_passed": True}
         decision = self.reason_agent.reason(gene_name, raw_score, kg_score, memory_prior, audit_stub)
         return {
+            "gene": gene_name,
             "pred_class": preds.tolist(),
             "raw_score": raw_score,
             "kg_score": kg_score,
@@ -599,13 +600,26 @@ def main() -> None:
         return
 
     # run-agents
-    if (outdir / "infer_result.json").exists() and (outdir / "model_weights.npz").exists():
-        analysis = json.loads((outdir / "infer_result.json").read_text(encoding="utf-8"))
+    infer_path = outdir / "infer_result.json"
+    model_path = outdir / "model_weights.npz"
+    proto_path = outdir / "prototypes.json"
+    reuse_cached_infer = False
+    if infer_path.exists() and model_path.exists() and proto_path.exists():
+        cached = json.loads(infer_path.read_text(encoding="utf-8"))
+        reuse_cached_infer = cached.get("gene") == args.gene
+
+    if reuse_cached_infer:
+        analysis = cached
     else:
-        x_src, y_src = make_synthetic_omics(800, 64, 4, shift=0.25)
-        x_tgt, y_tgt = make_synthetic_omics(180, 64, 3, shift=0.02)
-        prototypes = pipeline.train(x_src, y_src, x_tgt, y_tgt)
+        if model_path.exists() and proto_path.exists():
+            pipeline.transfer.load(model_path)
+            prototypes = load_prototypes(proto_path)
+        else:
+            x_src, y_src = make_synthetic_omics(800, 64, 4, shift=0.25)
+            x_tgt, y_tgt = make_synthetic_omics(180, 64, 3, shift=0.02)
+            prototypes = pipeline.train(x_src, y_src, x_tgt, y_tgt)
         analysis = pipeline.infer_target_gene(prototypes, make_synthetic_omics(32, 64, 3, 0.05)[0], gene_name=args.gene)
+        infer_path.write_text(json.dumps(analysis, ensure_ascii=False, indent=2), encoding="utf-8")
 
     result = pipeline.run_agents(args.raw_text, analysis, gene_name=args.gene)
     (outdir / "agents_result.json").write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
